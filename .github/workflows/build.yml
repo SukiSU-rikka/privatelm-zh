@@ -11,10 +11,14 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: jakoch/install-vulkan-sdk@v2
-        with:
-          version: latest
-          install_runtime: false
+      - name: 安装最新 Vulkan SDK（新版 glslc）
+        run: |
+          curl -sL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz
+          mkdir -p $HOME/vulkan-sdk && tar -xJf /tmp/vulkan-sdk.tar.xz -C $HOME/vulkan-sdk
+          GLSLC_BIN=$(find $HOME/vulkan-sdk -name glslc -type f | head -1)
+          echo "found: $GLSLC_BIN"
+          echo "$(dirname $GLSLC_BIN)" >> $GITHUB_PATH
+          echo "VULKAN_SDK=$(dirname $(dirname $GLSLC_BIN))" >> $GITHUB_ENV
       - name: 确认 glslc 版本
         run: |
           which glslc
