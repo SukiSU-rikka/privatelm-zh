@@ -1,0 +1,30 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: 写入签名配置
+        run: |
+          cat > android/key.properties <<KEYEOF
+          storeFile=$GITHUB_WORKSPACE/privatelm.jks
+          storePassword=privatelm
+          keyAlias=privatelm
+          keyPassword=privatelm
+          KEYEOF
+      - run: flutter pub get
+      - run: flutter build apk --release --target-platform android-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrivateLM-zh
+          path: build/app/outputs/flutter-apk/app-release.apk
