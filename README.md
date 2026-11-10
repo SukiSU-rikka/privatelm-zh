@@ -1,3 +1,13 @@
+# PrivateLM 中文版（汉化分支）
+
+基于官方 PrivateLM v1.0.7（orailnoor/cross-platform-llm-client）汉化：界面文案 957 处改为简体中文，固定签名（privatelm.jks）打包，APK 在本仓库 Releases 里。
+
+与官方版签名不同：装中文版前先卸载官方版；之后中文版可直接覆盖更新。
+
+构建要点：CI 需装最新 Vulkan SDK（新 glslc，否则 ggml 的 coopmat 着色器编译不过）；libwebm/build/*.cmake 被 .gitignore 误伤，已强制入库。
+
+---
+
 # PrivateLM
 
 [![Live Web App](https://img.shields.io/badge/Live_Demo-Try_Web_App-02569B?style=for-the-badge&logo=flutter&logoColor=white)](https://ai-chat-orailnoor.web.app/)
