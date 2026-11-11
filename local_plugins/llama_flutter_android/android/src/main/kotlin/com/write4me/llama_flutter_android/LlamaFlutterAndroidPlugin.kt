@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -22,6 +23,7 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
     private var currentModelPath: String? = null
     private var nativeLoadError: Throwable? = null
     private var clusterChannel: ClusterChannel? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     companion object {
         private const val TAG = "LlamaFlutterPlugin"
@@ -43,7 +45,14 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
         clusterChannel?.dispose()
         clusterChannel = null
         scope.cancel()
+        releaseWakeLock()
         if (isModelLoaded.get()) {
+            // Ask the native loop to stop before freeing (detach cannot
+            // join the generation thread; the process is going away, and
+            // this at least gives the loop its exit signal first).
+            if (nativeLoadError == null) {
+                nativeStop()
+            }
             nativeFreeModel()
         }
         LlamaHostApi.setUp(binding.binaryMessenger, null)
@@ -71,6 +80,9 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
 
         scope.launch {
             try {
+                // Never load over a generation that is still unwinding.
+                stopGenerationAndJoin()
+
                 // Start foreground service for long-running task
                 val intent = Intent(context, InferenceService::class.java)
                 ContextCompat.startForegroundService(context, intent)
@@ -143,6 +155,7 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
             // token or "done" can't leak into this reply.
             previous?.let { nativeStop(); it.join() }
             isStopping.set(false)
+            acquireWakeLock()
             try {
                 nativeGenerate(
                     request.prompt,
@@ -198,6 +211,8 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
                         }
                     }
                 }
+            } finally {
+                releaseWakeLock()
             }
         }
     }
@@ -214,7 +229,9 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
     override fun dispose(callback: (Result<Unit>) -> Unit) {
         scope.launch {
             try {
-                stop { }
+                // Wait for any in-flight generation to leave the native
+                // context before freeing it (see stopGenerationAndJoin).
+                stopGenerationAndJoin()
                 if (isModelLoaded.get()) {
                     nativeFreeModel()
                     isModelLoaded.set(false)
@@ -255,6 +272,7 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
             // token or "done" can't leak into this reply.
             previous?.let { nativeStop(); it.join() }
             isStopping.set(false)
+            acquireWakeLock()
             try {
                 // Only the newest image is sent (earlier ones stay as text).
                 // Its message gets llama.cpp's media marker, which the native
@@ -330,6 +348,8 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
                         }
                     }
                 }
+            } finally {
+                releaseWakeLock()
             }
         }
     }
@@ -457,6 +477,53 @@ class LlamaFlutterAndroidPlugin : FlutterPlugin, LlamaHostApi, ActivityAware {
                 }
             }
         }
+    }
+
+    /**
+     * Stops the in-flight native generation and waits until it has actually
+     * returned. Cancelling the coroutine does NOT interrupt a blocking JNI
+     * call, so freeing or reloading the model without this join races
+     * llama_decode on the generation thread — a use-after-free that kills
+     * the process when the user stops a reply and immediately switches or
+     * reloads a model.
+     */
+    private suspend fun stopGenerationAndJoin() {
+        val job = generationJob ?: return
+        // isCompleted, not isActive: stop() cancels the job first, which
+        // flips isActive immediately even though the blocked JNI call is
+        // still running. join() waits for the body to actually return.
+        if (!job.isCompleted) {
+            isStopping.set(true)
+            if (nativeLoadError == null) {
+                nativeStop()
+            }
+            job.join()
+        }
+        generationJob = null
+    }
+
+    /** Holds the CPU while a generation runs (e.g. with the screen off, in
+     *  server mode). Bounded to one hour so a missed release can never
+     *  drain the battery indefinitely. */
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) return
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrivateLM:Inference").apply {
+                setReferenceCounted(false)
+                acquire(60 * 60 * 1000L)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Wake lock unavailable: ${e.message}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (_: Exception) {
+        }
+        wakeLock = null
     }
 
     private fun ensureNativeLoaded(): Throwable? {

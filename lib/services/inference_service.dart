@@ -3,6 +3,7 @@ import 'package:get/get.dart';
 import 'hive_service.dart';
 import '../core/constants.dart';
 import 'device_info_service.dart';
+import 'gguf_metadata.dart';
 import 'app_log_service.dart';
 import 'cluster_service.dart';
 import 'stop_sequence_filter.dart';
@@ -102,7 +103,25 @@ class InferenceService extends GetxService {
       final cpuOnly = liteRtMode == 'cpu_safe';
       final forceLiteRtCpu = isLiteRt && cpuOnly;
       final shouldTryLiteRtGpu = isLiteRt && !cpuOnly;
-      final allowGgufGpu = !isLiteRt && !cpuOnly;
+      // GGUF GPU circuit breaker (the mechanism AppConstants
+      // .keyGgufGpuPending always described but nothing implemented): the
+      // flag is armed after a GPU load and disarmed by the first successful
+      // reply. Still armed at this point means the last GPU session ended
+      // before producing one — the process most likely died on the GPU
+      // path. Force CPU for this load instead of risking a crash loop.
+      final ggufGpuCrashedLastTime = !isLiteRt &&
+          (_hive.getSetting<bool>(AppConstants.keyGgufGpuPending,
+                  defaultValue: false) ??
+              false);
+      if (ggufGpuCrashedLastTime) {
+        print('[Inference] GGUF GPU flag still armed from the last session '
+            '— forcing CPU for this load');
+        Get.find<AppLogService>().warning(
+          'GGUF GPU circuit breaker tripped',
+          details: 'previous GPU session ended before its first reply',
+        );
+      }
+      final allowGgufGpu = !isLiteRt && !cpuOnly && !ggufGpuCrashedLastTime;
       // Clear crash state left by older versions of the app.
       await _hive.setSetting(AppConstants.keyLiteRtGpuCrashDetected, false);
       await _hive.setSetting(AppConstants.keyLiteRtGpuLoadPending, false);
@@ -124,6 +143,29 @@ class InferenceService extends GetxService {
       final finalContextSize =
           isLiteRt ? contextSize.clamp(512, 4096) : contextSize;
 
+      // Stability: enforce the memory estimate here, in the one load path
+      // every caller goes through. The model page's warning sheet is
+      // advisory — tapping "continue" used to load at the raw setting, and
+      // a long chat then grew the KV cache until Android killed the app.
+      // Clamp the context to what actually fits, or refuse cleanly.
+      var loadContextSize = finalContextSize;
+      if (!isLiteRt && modelPath.toLowerCase().endsWith('.gguf')) {
+        final clamped = await _clampGgufContext(modelPath, finalContextSize);
+        if (clamped == null) {
+          isModelLoaded.value = false;
+          isLoadingModel.value = false;
+          loadingModelName.value = '';
+          modelLoadProgress.value = 0.0;
+          Get.find<AppLogService>().error(
+            'Local model load refused: does not fit in available RAM',
+            details: 'model=$modelPath, requestedCtx=$finalContextSize',
+          );
+          return '错误：可用内存不足，这个模型即使使用最小上下文也装不下。'
+              '请关闭其他应用后重试，或换一个更小的模型。';
+        }
+        loadContextSize = clamped;
+      }
+
       final lastLoadedContext =
           _hive.getSetting<int>('last_loaded_context_size') ?? 0;
       final contextChanged = isLiteRt && lastLoadedContext != finalContextSize;
@@ -144,7 +186,7 @@ class InferenceService extends GetxService {
       var result = await _loadModelOnEngine(
         modelPath: modelPath,
         modelRuntime: modelRuntime,
-        contextSize: finalContextSize,
+        contextSize: loadContextSize,
         deviceTier: deviceTier,
         isTensorSoC: isTensorSoC,
         liteRtPerformanceMode: liteRtMode,
@@ -188,8 +230,13 @@ class InferenceService extends GetxService {
       gpuName.value = result.gpuName;
       gpuLayersUsed.value = result.gpuLayers;
       isGpuAccelerated.value = result.backend == 'gpu' || result.gpuLayers > 0;
+      if (!isLiteRt && result.backend == 'gpu') {
+        // Arm the GPU circuit breaker; generate() disarms it once a reply
+        // completes, proving the GPU path survives real work.
+        await _hive.setSetting(AppConstants.keyGgufGpuPending, true);
+      }
       contextTokensUsed.value = 0;
-      contextTokensTotal.value = finalContextSize;
+      contextTokensTotal.value = loadContextSize;
 
       await _hive.setSetting(AppConstants.keyLocalModelPath, modelPath);
       await _hive.setSetting(
@@ -370,6 +417,11 @@ class InferenceService extends GetxService {
       final finalText = stopSequenceHit ? stopFilter.text : result;
 
       await refreshContextInfo();
+      if (isCurrent() && tokenCount.value > 0) {
+        // A completed reply proves an armed GPU load was healthy; disarm
+        // the circuit breaker so the next load may use the GPU again.
+        unawaited(_hive.setSetting(AppConstants.keyGgufGpuPending, false));
+      }
       if (isCurrent()) {
         isGenerating.value = false;
         generationSource.value = '';
@@ -456,6 +508,51 @@ class InferenceService extends GetxService {
       return device.isTensorSoC.value;
     } catch (_) {
       return false;
+    }
+  }
+
+  /// Largest context ≤ [requested] whose estimated footprint (weights +
+  /// KV cache + runtime overhead, from the GGUF header) fits in the memory
+  /// currently available. Returns [requested] unchanged when no estimate is
+  /// possible (unreadable header or unknown RAM), and null when even a
+  /// 512-token context cannot fit — loading anyway would just get the
+  /// process killed by Android mid-chat.
+  Future<int?> _clampGgufContext(String modelPath, int requested) async {
+    try {
+      final gguf = await readGgufInfo(modelPath);
+      if (gguf == null) return requested;
+      final device = Get.find<DeviceInfoService>();
+      await device.refreshMemoryInfo();
+      var budgetBytes =
+          (device.availableRamGB.value * 1024 * 1024 * 1024).round();
+      if (budgetBytes <= 0) return requested;
+      // The currently loaded model is unloaded first; count its file size
+      // as available again (same convention as the model page's estimate).
+      if (isModelLoaded.value) {
+        final prevPath = _hive.getSetting<String>(AppConstants.keyLocalModelPath);
+        if (prevPath != null && prevPath.isNotEmpty && prevPath != modelPath) {
+          budgetBytes += await _fileBytes(prevPath);
+        }
+      }
+      if (gguf.estimateBytes(requested) <= budgetBytes) return requested;
+      final fit = gguf.maxContextFitting(budgetBytes);
+      if (fit == null) {
+        print('[Inference] GGUF does not fit: needs '
+            '~${gguf.estimateBytes(512) ~/ (1024 * 1024)}MB even at 512 ctx, '
+            'budget ${budgetBytes ~/ (1024 * 1024)}MB');
+        return null;
+      }
+      print('[Inference] Clamping context $requested -> $fit so the model '
+          'fits in available RAM (est. '
+          '${gguf.estimateBytes(fit) ~/ (1024 * 1024)}MB of '
+          '${budgetBytes ~/ (1024 * 1024)}MB)');
+      Get.find<AppLogService>().info(
+        'Context clamped for memory',
+        details: 'model=$modelPath, requested=$requested, clamped=$fit',
+      );
+      return fit;
+    } catch (_) {
+      return requested;
     }
   }
 

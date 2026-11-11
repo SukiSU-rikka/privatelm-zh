@@ -835,6 +835,13 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
     
     // Memory optimization: reduce memory usage by limiting batch processing
     ctx_params.n_batch = 512;  // Process smaller batches to reduce memory spikes
+    // Quantized KV cache: half the footprint of the F16 default. Long chats
+    // grow the cache to the full context, and on phones that growth is what
+    // gets the process killed. v0.9.0 auto-enables flash attention when the
+    // V cache is quantized (its default flash_attn_type is AUTO), and K/V
+    // share a type as MLA models require.
+    ctx_params.type_k = GGML_TYPE_Q8_0;
+    ctx_params.type_v = GGML_TYPE_Q8_0;
     // Don't push CPU-resident tensor ops to the GPU in CPU-only mode, nor
     // over Wi-Fi to a worker in cluster mode.
     ctx_params.op_offload = n_gpu_layers != 0 && !has_cluster;
@@ -952,8 +959,10 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
         env->DeleteGlobalRef(g_token_callback);
         g_token_callback = nullptr;
     }
-    g_token_callback = env->NewGlobalRef(token_callback);
-    
+    // The global ref for the token callback is only taken just before the
+    // generation loop (below): every early return before that point used to
+    // leak it.
+
     if (!g_model || !g_ctx || !g_vocab) {
         jclass exception = env->FindClass("java/lang/IllegalStateException");
         env->ThrowNew(exception, "Model not loaded");
@@ -1126,6 +1135,19 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
     int tokens_processed = (int)n_keep;
 
     while (tokens_processed < (int)tokens.size()) {
+        if (g_stop_flag) {
+            // Stopped during prompt processing (long prompts take minutes
+            // on CPU; without this check the stop button did nothing until
+            // prefill finished). State stays consistent: g_cached_tokens
+            // was already cut back to n_keep above, and the next call
+            // removes everything past its own keep point, so the partial
+            // prompt sitting in the KV cache cannot corrupt a later turn.
+            g_n_past = (int)n_keep;
+            llama_batch_free(batch);
+            jclass exception = env->FindClass("java/lang/RuntimeException");
+            env->ThrowNew(exception, "Stopped during prompt processing");
+            return;
+        }
         batch.n_tokens = 0;
         int batch_size = std::min((int)tokens.size() - tokens_processed, max_batch_size);
 
@@ -1153,6 +1175,10 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
     g_n_past = (int)tokens.size();
     g_cached_tokens = tokens;
     }  // end text-only prompt path
+
+    // Take the token callback's global ref only now that nothing can
+    // return early anymore; it is released after the generation loop.
+    g_token_callback = env->NewGlobalRef(token_callback);
 
     // Create sampler chain with all parameters
     if (g_sampler) {

@@ -34,6 +34,48 @@ class LoadResult {
   });
 }
 
+/// Detects runaway repetition in a streamed reply: the same piece dozens
+/// of times in a row, or a short text cycle looping with no new content.
+/// Corrupt-logit loops (the Gemma garbage output seen on some SoCs) are
+/// not caught by EOS/stop conditions; left alone they run to the token or
+/// time cap at full power, holding peak memory and heating the phone.
+/// Thresholds are deliberately high so legitimate repetitive text
+/// (lists, code, tables) never trips them.
+class _RepetitionGuard {
+  String _lastPiece = '';
+  int _runLength = 0;
+  final StringBuffer _tail = StringBuffer();
+  int _adds = 0;
+
+  /// Feeds one streamed piece; returns true when a loop is detected.
+  bool add(String piece) {
+    if (piece.isEmpty) return false;
+    if (piece == _lastPiece) {
+      if (++_runLength >= 40) return true;
+    } else {
+      _lastPiece = piece;
+      _runLength = 1;
+    }
+    _tail.write(piece);
+    var text = _tail.toString();
+    if (text.length > 768) {
+      _tail.clear();
+      text = text.substring(text.length - 768);
+      _tail.write(text);
+    }
+    // The cycle check scans every unit length; run it periodically.
+    if (++_adds % 8 != 0) return false;
+    final tail = _tail.toString();
+    for (var unit = 2; unit <= 64; unit++) {
+      if (tail.length < unit * 10) continue;
+      final candidate = tail.substring(tail.length - unit);
+      if (candidate.trim().isEmpty) continue;
+      if (tail.endsWith(candidate * 10)) return true;
+    }
+    return false;
+  }
+}
+
 /// Android & iOS inference engine — wraps llama_flutter_android.
 class InferenceEngine {
   LlamaController? _controller;
@@ -124,7 +166,12 @@ class InferenceEngine {
         final modelBytes = await _fileLength(modelPath);
         final visionBytes =
             mmprojPath == null ? 0 : await _fileLength(mmprojPath);
-        final needed = ((modelBytes + visionBytes) * 1.25).round();
+        // Full offload keeps the weights resident twice on a UMA phone:
+        // once as the file pages the process maps/touches, once as GPU
+        // buffers — with the KV cache and compute buffers on top. The old
+        // 1.25x factor under-counted that and let big models run out of
+        // memory mid-chat; budget for both copies.
+        final needed = (modelBytes + visionBytes) * 2;
         final free = gpu.freeRamBytes;
         if (free > 0 && needed > free) {
           print('[Inference] Model needs ~${needed ~/ (1024 * 1024)}MB for GPU '
@@ -436,6 +483,8 @@ class InferenceEngine {
     }
 
     int tokenCount = 0;
+    int silentRun = 0;
+    final repGuard = _RepetitionGuard();
     _subscription = stream.listen(
       (token) {
         if (tokenCount == 0) {
@@ -450,7 +499,24 @@ class InferenceEngine {
           finish(buffer.toString());
         });
         final clean = _sanitizeGemmaGarbage(token);
-        if (clean.isEmpty) return;
+        if (clean.isEmpty) {
+          // Tokens that clean to nothing (special/garbage tokens) keep the
+          // idle timer alive above, so a corrupt-logit loop emitting them
+          // forever would otherwise only end at the hard timeout — minutes
+          // at full power. A long run of them is a loop, not a slow answer.
+          if (++silentRun >= 200) {
+            print('[Inference] Garbage-token loop suspected — stopping');
+            final partial = buffer.toString();
+            finish(partial.isEmpty ? _loopNote : '$partial$_loopNote');
+          }
+          return;
+        }
+        silentRun = 0;
+        if (repGuard.add(clean)) {
+          print('[Inference] Repetition loop detected — stopping');
+          finish('${buffer.toString()}$_loopNote');
+          return;
+        }
         buffer.write(clean);
         tokenCount++;
         onToken?.call(clean);
@@ -513,6 +579,7 @@ class InferenceEngine {
     bool completed = false;
     bool hasVisibleOutput = false;
     var tokenCount = 0;
+    final repGuard = _RepetitionGuard();
     final conversation = _liteConversation;
 
     // Unless the stream ended on its own, the native engine is still
@@ -558,6 +625,11 @@ class InferenceEngine {
 
           if (tokenCount == 0) {
             print('[Inference] LiteRT-LM multimodal FIRST TOKEN received');
+          }
+          if (repGuard.add(text)) {
+            print('[Inference] LiteRT repetition loop detected — stopping');
+            finish('${buffer.toString()}$_loopNote');
+            return;
           }
           _liteConversationHasMessages = true;
           tokenCount++;
@@ -618,6 +690,11 @@ class InferenceEngine {
 
         if (tokenCount == 0) {
           print('[Inference] LiteRT-LM FIRST TOKEN received');
+        }
+        if (repGuard.add(text)) {
+          print('[Inference] LiteRT repetition loop detected — stopping');
+          finish('${buffer.toString()}$_loopNote');
+          return;
         }
         _liteConversationHasMessages = true;
         tokenCount++;
@@ -787,6 +864,9 @@ class InferenceEngine {
 
   static const _timeLimitNote =
       '\n\n⚠️ Stopped: this reply hit the time limit for one response.';
+
+  static const _loopNote =
+      '\n\n⚠️ Stopped: the model fell into a repetition loop.';
 
   String _runtimeFor(String modelPath, String? modelRuntime) {
     final runtime = modelRuntime?.toLowerCase();
